@@ -1,0 +1,4 @@
+# 安装后由 dsh plugin 合并进 profile
+- insert:
+    - id: open-file-location
+      name: dsh-open-file-location

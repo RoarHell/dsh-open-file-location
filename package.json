@@ -1,0 +1,24 @@
+{
+  "name": "dsh-open-file-location",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 桌面版插件：聊天里的文件引用支持右键 / 悬停按钮「打开文件位置」",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  }
+}
