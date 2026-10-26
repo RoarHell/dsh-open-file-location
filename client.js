@@ -1,12 +1,11 @@
 /**
  * open-file-location · Client half
  *
- * 给聊天正文里的文件引用（file mention / 本地文件链接）加上：
- *   1. 右键菜单「打开文件位置」
- *   2. 悬停时出现的小按钮，一点直接定位到资源管理器
+ * Chat file references gain:
+ *   1. Right-click menu "打开文件位置"
+ *   2. Hover folder chip that reveals the file immediately
  *
- * 识别方式：文件引用按钮固定带 title=完整路径（Markdown 渲染约定），
- * 不依赖会被 CSS Modules 哈希的 class 名。
+ * File chips/links carry `title` = path (Markdown render convention).
  */
 window.__ModuleLoader__.load({
   id: 'dsh-open-file-location',
@@ -17,44 +16,82 @@ window.__ModuleLoader__.load({
       openPreview: '在侧边栏预览',
     }
 
-    /** Path-shaped titles on chat file chips/links (relative, absolute POSIX, or Windows). */
     function looksLikePath(title) {
       if (typeof title !== 'string' || title.length === 0) return false
       if (title.includes('\n') || title.includes('\r')) return false
+      if (/^[a-z][a-z0-9+.-]*:/i.test(title) && !/^file:/i.test(title)) return false
       if (/[\\/]/.test(title)) return true
       return /\.[A-Za-z0-9]{1,8}$/.test(title)
     }
 
-    /** Resolve one title to an absolute Host path when a session cwd is known. */
-    function toHostPath(path, cwd) {
-      if (/^([A-Za-z]:[\\/]|\/)/.test(path)) return path
-      if (typeof cwd === 'string' && cwd.length > 0) {
-        const sep = cwd.includes('\\') ? '\\' : '/'
-        return cwd.replace(/[\\/]+$/, '') + sep + path.replace(/^\.?[\\/]+/, '')
+    /** Strip #L12 / #L12-L20 suffixes and file:// wrappers. */
+    function cleanPath(raw) {
+      let p = String(raw ?? '').trim()
+      if (p.startsWith('file://')) {
+        try { p = decodeURIComponent(p.replace(/^file:\/\/\//i, '').replace(/^file:\/\//i, '')) } catch (_e) { /* keep */ }
       }
-      return path
+      p = p.replace(/#L\d+(?:-L?\d+)?$/i, '')
+      return p
     }
 
-    function pickSessionCwd(context) {
-      try {
-        const list = context.sessions?.list?.getSnapshot?.()
-        if (list == null) return undefined
-        const byId = list.byId ?? {}
-        const currentId = list.currentId ?? list.foregroundId ?? list.activeId
-        if (currentId != null && byId[currentId]?.cwd) return byId[currentId].cwd
-        for (const id of Object.keys(byId)) {
-          if (byId[id]?.cwd) return byId[id].cwd
-        }
-      } catch (_error) {
-        return undefined
+    function isAbsolute(p) {
+      return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.startsWith('/')
+    }
+
+    function joinPath(cwd, rel) {
+      const sep = cwd.includes('\\') ? '\\' : '/'
+      const left = cwd.replace(/[\\/]+$/, '')
+      const right = rel.replace(/^[.][\\/]+/, '').replace(/^[\\/]+/, '')
+      return left + sep + right
+    }
+
+    function normalizeForWindows(p) {
+      return p.replace(/\//g, '\\')
+    }
+
+    /** Every session cwd currently projected — list snapshot has no "current" flag. */
+    function collectCwds(context) {
+      const out = []
+      const push = (cwd) => {
+        if (typeof cwd === 'string' && cwd.length > 0 && !out.includes(cwd)) out.push(cwd)
       }
-      return undefined
+      try {
+        const snap = context.sessions?.list?.getSnapshot?.()
+        if (snap != null) {
+          for (const id of snap.ids ?? Object.keys(snap.byId ?? {})) {
+            push(snap.byId?.[id]?.cwd)
+          }
+          for (const row of Object.values(snap.byId ?? {})) push(row?.cwd)
+        }
+      } catch (_error) { /* ignore */ }
+      // Fallbacks seen on various shells.
+      try { push(context.uiWorkspace?.current?.cwd) } catch (_error) { /* ignore */ }
+      try {
+        const el = document.querySelector('[data-session-cwd], [data-cwd]')
+        push(el?.getAttribute('data-session-cwd') ?? el?.getAttribute('data-cwd') ?? undefined)
+      } catch (_error) { /* ignore */ }
+      return out
+    }
+
+    /** Candidate Host paths for one authored token, best first. */
+    function buildCandidates(raw, context) {
+      const cleaned = cleanPath(raw)
+      const candidates = []
+      const add = (p) => {
+        if (typeof p === 'string' && p.length > 0 && !candidates.includes(p)) candidates.push(p)
+        const win = p != null ? normalizeForWindows(p) : ''
+        if (win && win !== p && !candidates.includes(win)) candidates.push(win)
+      }
+      if (isAbsolute(cleaned)) add(cleaned)
+      for (const cwd of collectCwds(context)) add(joinPath(cwd, cleaned))
+      // Last resort: as authored (Host may workspace-resolve).
+      add(cleaned)
+      return candidates
     }
 
     return {
       inject: ['remote', 'remote.session', 'sessions', 'slots'],
       apply(ctx) {
-        // ---- styles ----
         const style = document.createElement('style')
         style.id = 'dsh-open-file-location-style'
         style.textContent = `
@@ -130,7 +167,6 @@ window.__ModuleLoader__.load({
         document.head.appendChild(style)
         ctx.effect(() => () => style.remove())
 
-        // ---- floating menu host ----
         const menuRoot = document.createElement('div')
         menuRoot.id = 'dsh-open-file-location-menu'
         document.body.appendChild(menuRoot)
@@ -147,31 +183,35 @@ window.__ModuleLoader__.load({
           el.textContent = message
           document.body.appendChild(el)
           window.clearTimeout(toastTimer)
-          toastTimer = window.setTimeout(() => { el.remove() }, 2200)
+          toastTimer = window.setTimeout(() => { el.remove() }, 2800)
         }
 
-        // ---- reveal ----
         let busy = false
         async function revealPath(rawPath) {
           if (busy || typeof rawPath !== 'string' || rawPath.length === 0) return
           busy = true
           try {
-            const path = toHostPath(rawPath, pickSessionCwd(ctx))
-            const result = await ctx.remote.session.openWorkspacePath({ path, action: 'reveal' })
-            if (!result || result.ok !== true) toast(LABEL.revealFail)
-          } catch (_error) {
-            // Host unreachable or refused the handoff — announce, do not throw.
-            toast(LABEL.revealFail)
+            const candidates = buildCandidates(rawPath, ctx)
+            let opened = false
+            for (const path of candidates) {
+              try {
+                const result = await ctx.remote.session.openWorkspacePath({ path, action: 'reveal' })
+                if (result && result.ok === true) {
+                  opened = true
+                  break
+                }
+              } catch (_try) {
+                // Try the next candidate.
+              }
+            }
+            if (!opened) toast(LABEL.revealFail + '（' + cleanPath(rawPath) + '）')
           } finally {
             busy = false
           }
         }
 
-        // ---- locate the file-mention control ----
         function isFileControl(el) {
-          if (el instanceof HTMLButtonElement) {
-            return looksLikePath(el.getAttribute('title') ?? '')
-          }
+          if (el instanceof HTMLButtonElement) return looksLikePath(el.getAttribute('title') ?? '')
           if (el instanceof HTMLAnchorElement) {
             const title = el.getAttribute('title') ?? ''
             const href = el.getAttribute('href') ?? ''
@@ -182,9 +222,7 @@ window.__ModuleLoader__.load({
 
         function pathOf(el) {
           if (el instanceof HTMLButtonElement) return el.getAttribute('title') ?? ''
-          if (el instanceof HTMLAnchorElement) {
-            return el.getAttribute('title') || el.getAttribute('href') || ''
-          }
+          if (el instanceof HTMLAnchorElement) return el.getAttribute('title') || el.getAttribute('href') || ''
           return ''
         }
 
@@ -197,7 +235,6 @@ window.__ModuleLoader__.load({
           return null
         }
 
-        // ---- hover chip ----
         const marked = new WeakSet()
         function ensureHoverButton(fileBtn) {
           if (marked.has(fileBtn)) return
@@ -230,18 +267,13 @@ window.__ModuleLoader__.load({
           holder.appendChild(chip)
         }
 
-        document.addEventListener(
-          'mouseover',
-          (event) => {
-            const t = event.target
-            if (!(t instanceof Element)) return
-            const fileBtn = fileControlFrom(t)
-            if (fileBtn != null) ensureHoverButton(fileBtn)
-          },
-          true,
-        )
+        document.addEventListener('mouseover', (event) => {
+          const t = event.target
+          if (!(t instanceof Element)) return
+          const fileBtn = fileControlFrom(t)
+          if (fileBtn != null) ensureHoverButton(fileBtn)
+        }, true)
 
-        // ---- right-click menu ----
         function showMenu(x, y, items) {
           unmountMenu()
           const box = document.createElement('div')
@@ -264,44 +296,31 @@ window.__ModuleLoader__.load({
           menuRoot.appendChild(box)
         }
 
-        document.addEventListener(
-          'contextmenu',
-          (event) => {
-            const t = event.target
-            if (!(t instanceof Element)) return
-            const fileBtn = fileControlFrom(t)
-            if (fileBtn == null) return
-            const path = pathOf(fileBtn)
-            if (!looksLikePath(path)) return
-            event.preventDefault()
-            event.stopPropagation()
-            const items = [{ id: 'reveal', label: LABEL.reveal, run: () => { void revealPath(path) } }]
-            if (fileBtn instanceof HTMLButtonElement) {
-              items.push({ id: 'preview', label: LABEL.openPreview, run: () => { fileBtn.click() } })
-            }
-            showMenu(event.clientX, event.clientY, items)
-          },
-          true,
-        )
+        document.addEventListener('contextmenu', (event) => {
+          const t = event.target
+          if (!(t instanceof Element)) return
+          const fileBtn = fileControlFrom(t)
+          if (fileBtn == null) return
+          const path = pathOf(fileBtn)
+          if (!looksLikePath(path)) return
+          event.preventDefault()
+          event.stopPropagation()
+          const items = [{ id: 'reveal', label: LABEL.reveal, run: () => { void revealPath(path) } }]
+          if (fileBtn instanceof HTMLButtonElement) {
+            items.push({ id: 'preview', label: LABEL.openPreview, run: () => { fileBtn.click() } })
+          }
+          showMenu(event.clientX, event.clientY, items)
+        }, true)
 
-        document.addEventListener(
-          'mousedown',
-          (event) => {
-            if (!(event.target instanceof Element)) return
-            if (event.target.closest('.ofl-menu') == null) unmountMenu()
-          },
-          true,
-        )
+        document.addEventListener('mousedown', (event) => {
+          if (!(event.target instanceof Element)) return
+          if (event.target.closest('.ofl-menu') == null) unmountMenu()
+        }, true)
 
-        document.addEventListener(
-          'keydown',
-          (event) => {
-            if (event.key === 'Escape') unmountMenu()
-          },
-          true,
-        )
+        document.addEventListener('keydown', (event) => {
+          if (event.key === 'Escape') unmountMenu()
+        }, true)
 
-        // `require` is unused for this pure-DOM client half; keep the factory signature.
         void require
       },
     }
